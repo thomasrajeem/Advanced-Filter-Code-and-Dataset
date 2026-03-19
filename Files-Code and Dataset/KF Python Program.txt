@@ -1,0 +1,294 @@
+import numpy as np
+import random
+import rospy
+from geometry_msgs.msg import Twist
+import sys, select, termios, tty
+from nav_msgs.msg import Odometry
+from sensor_msgs.msg import LaserScan
+from sensor_msgs.msg import PointCloud2
+from squaternion import Quaternion
+import csv
+import threading
+import time
+
+class KalmanFilter:
+    def __init__(self, initial_state, process_noise, measurement_noise):
+        self.state = np.array([initial_state[0], initial_state[1], initial_state[2], 0.0, 0.0, 0.0])
+        self.P = np.eye(6) * 0.1  
+        self.Q = np.eye(6) * process_noise  
+        self.R = np.eye(5) * measurement_noise  
+        self.base_Q = self.Q.copy()
+        self.base_R = self.R.copy()
+        self.last_measurement = np.array([initial_state[0], initial_state[1], initial_state[2], 0.0, 0.0])
+        self.anomaly_count = 0
+        self.error_threshold = 1.0  # Threshold for anomaly detection
+        self.last_time = time.time()
+
+    def predict(self, control_input, dt=0.1, attack_freq=0):
+        v, w = control_input[0], control_input[2]
+        theta = self.state[2]
+        
+        F = np.eye(6)
+        F[0, 3] = dt * np.cos(theta)
+        F[1, 4] = dt * np.sin(theta)
+        F[2, 5] = dt
+        
+        B = np.zeros((6, 2))
+        B[3, 0] = 1.0  # vx = v
+        B[5, 1] = 1.0  # omega = w
+        
+        u = np.array([v, w])
+        
+        self.Q = self.base_Q * 4 if attack_freq >= 1000 else self.base_Q
+
+        self.state = F @ self.state + B @ u
+        self.P = F @ self.P @ F.T + self.Q
+
+    def update(self, measurement, attack_freq=0):
+        H = np.zeros((5, 6))
+        H[0, 0] = 1.0  # odom x
+        H[1, 1] = 1.0  # odom y
+        H[2, 2] = 1.0  # odom theta
+        H[3, 0] = 1.0  # LiDAR x
+        H[4, 1] = 1.0  # LiDAR y
+        
+        if attack_freq >= 1000:
+            self.R = np.diag([2.0, 2.0, 2.0, 0.5, 0.5])  # Higher noise for odom, lower for LiDAR
+        else:
+            self.R = self.base_R
+
+        z = np.array(measurement)
+        y = z - H @ self.state
+        
+        S = H @ self.P @ H.T + self.R
+        K = self.P @ H.T @ np.linalg.inv(S)
+        
+        self.state = self.state + K @ y
+        self.P = (np.eye(6) - K @ H) @ self.P
+
+        return y 
+
+    def estimate(self):
+        return self.state[:3]  # Return only position and orientation
+
+    def detect_anomaly(self, measurement, attack_freq=0, control_input=np.array([0.0, 0.0, 0.0]), dt=0.1):
+        residual = self.update(measurement, attack_freq)
+        diff = np.linalg.norm(residual)
+        rate_of_change = np.linalg.norm(np.array(measurement) - self.last_measurement) / dt
+        expected_change = np.linalg.norm(control_input * dt)
+        
+        self.last_measurement = np.array(measurement).copy()
+        
+        is_anomaly = False
+        if attack_freq >= 1000:
+            is_anomaly = diff > self.error_threshold or abs(rate_of_change - expected_change) > 1.0
+            if is_anomaly:
+                self.anomaly_count += 1
+        elif diff > 2.0:
+            is_anomaly = True
+        
+        return {
+            'is_anomaly': is_anomaly,
+            'diff': diff,
+            'rate_of_change': rate_of_change,
+            'expected_change': expected_change,
+            'estimated_state': self.estimate(),
+            'covariance_trace': np.trace(self.P[:3, :3])
+        }
+
+class Teleop:
+    def __init__(self):
+        rospy.init_node('husky_teleoperation_kf_lidar')
+
+        self.odom_x = self.odom_y = self.odom_z = self.angle = 0.0
+        self.lidar_x = self.lidar_y = 0.0  # LiDAR-based position
+        self.lidar_data = []
+        self.linear_vel = self.angular_vel = 0.0
+        self.attack_active = False
+
+        self.data_lock = threading.Lock()
+        self.output_data = [['time', 'odom_x', 'odom_y', 'odom_theta', 'lidar_x', 'lidar_y',
+                           'est_x', 'est_y', 'est_theta', 
+                           'diff', 'rate_of_change', 'expected_change',
+                           'covariance_trace',
+                           'linear_vel', 'angular_vel', 
+                           'anomaly_detected', 'attack_active']]
+
+        self.pub_vel = rospy.Publisher('cmd_vel', Twist, queue_size=10)
+        self.sub_odom = rospy.Subscriber('odometry/filtered', Odometry, self.odom_callback)
+        self.sub_lidar = rospy.Subscriber('front/scan', LaserScan, self.lidar_callback)
+        self.sub_pointcloud = rospy.Subscriber('points', PointCloud2, self.pointcloud_callback)
+        self.rate = rospy.Rate(10)
+
+        self.settings = termios.tcgetattr(sys.stdin)
+
+        initial_state = np.array([0.0, 0.0, 0.0])
+        self.kalman_filter = KalmanFilter(initial_state=initial_state, 
+                                        process_noise=0.01, 
+                                        measurement_noise=0.1)
+
+        self.last_time = time.time()
+        self.control_input = np.array([0.0, 0.0, 0.0])
+        rospy.on_shutdown(self.save_data)
+
+    def odom_callback(self, msg):
+        self.odom_x = msg.pose.pose.position.x
+        self.odom_y = msg.pose.pose.position.y
+        self.odom_z = msg.pose.pose.position.z
+        q = Quaternion(msg.pose.pose.orientation.w,
+                      msg.pose.pose.orientation.x,
+                      msg.pose.pose.orientation.y,
+                      msg.pose.pose.orientation.z)
+        self.angle = round(q.to_euler(degrees=False)[2], 4)
+
+        measurement = [self.odom_x, self.odom_y, self.angle, self.lidar_x, self.lidar_y]
+        dt = time.time() - self.last_time
+        attack_freq = 1000 if self.attack_active else 0
+        
+        self.kalman_filter.predict(self.control_input, dt, attack_freq)
+        anomaly_info = self.kalman_filter.detect_anomaly(measurement, attack_freq, self.control_input, dt)
+        self.last_time = time.time()
+
+        if anomaly_info['is_anomaly'] and attack_freq >= 1000:
+            self.correct_control_input(anomaly_info['estimated_state'])
+
+        print(f"\nOdometry: x={self.odom_x:.2f}, y={self.odom_y:.2f}, theta={self.angle:.2f}")
+        print(f"LiDAR: x={self.lidar_x:.2f}, y={self.lidar_y:.2f}")
+        print(f"Estimated: x={anomaly_info['estimated_state'][0]:.2f}, "
+              f"y={anomaly_info['estimated_state'][1]:.2f}, "
+              f"theta={anomaly_info['estimated_state'][2]:.2f}")
+        print(f"Diff: {anomaly_info['diff']:.3f}, Rate: {anomaly_info['rate_of_change']:.2f}, "
+              f"Expected: {anomaly_info['expected_change']:.2f}")
+        print(f"Covariance Trace: {anomaly_info['covariance_trace']:.3f}")
+        print(f"Anomaly: {anomaly_info['is_anomaly']}, Attack: {self.attack_active}")
+
+        if anomaly_info['is_anomaly']:
+            rospy.logwarn(f"Anomaly! Diff: {anomaly_info['diff']:.3f}, "
+                         f"Rate: {anomaly_info['rate_of_change']:.2f}")
+
+        with self.data_lock:
+            self.output_data.append([
+                time.time(),
+                self.odom_x, self.odom_y, self.angle, self.lidar_x, self.lidar_y,
+                anomaly_info['estimated_state'][0],
+                anomaly_info['estimated_state'][1],
+                anomaly_info['estimated_state'][2],
+                anomaly_info['diff'],
+                anomaly_info['rate_of_change'],
+                anomaly_info['expected_change'],
+                anomaly_info['covariance_trace'],
+                self.linear_vel, self.angular_vel,
+                int(anomaly_info['is_anomaly']),
+                int(self.attack_active)
+            ])
+
+    def lidar_callback(self, msg):
+        self.lidar_data = msg.ranges
+        if self.lidar_data:
+            min_range = min([r for r in self.lidar_data if r > 0.1])  # Ignore very small ranges
+            theta = self.angle
+            self.lidar_x = self.odom_x + min_range * np.cos(theta)
+            self.lidar_y = self.odom_y + min_range * np.sin(theta)
+
+    def pointcloud_callback(self, msg):
+        pass
+
+    def publish_velocity(self):
+        cmd_vel = Twist()
+        cmd_vel.linear.x = self.linear_vel
+        cmd_vel.angular.z = self.angular_vel
+        self.pub_vel.publish(cmd_vel)
+
+    def correct_control_input(self, estimated_state):
+        self.linear_vel *= 0.5  
+        desired_theta = estimated_state[2]
+        current_theta = self.angle
+        self.angular_vel = np.clip(desired_theta - current_theta, -0.5, 0.5)  
+        rospy.loginfo(f"Correcting control: linear_vel={self.linear_vel:.2f}, angular_vel={self.angular_vel:.2f}")
+
+    def attack_flood(self):
+        rospy.logwarn("Starting 1000Hz attack...")
+        rate = rospy.Rate(1000)
+        msg = Twist()
+        
+        while not rospy.is_shutdown() and self.attack_active:
+            msg.linear.x = random.uniform(-1.0, 1.0)
+            msg.angular.z = random.uniform(-1.0, 1.0)
+            self.pub_vel.publish(msg)
+            rate.sleep()
+        rospy.logwarn("Attack stopped.")
+
+    def get_key(self):
+        tty.setraw(sys.stdin.fileno())
+        rlist, _, _ = select.select([sys.stdin], [], [], 0.1)
+        key = sys.stdin.read(1) if rlist else ''
+        termios.tcsetattr(sys.stdin, termios.TCSADRAIN, self.settings)
+        return key
+
+    def save_data(self):
+        filename = f'odom_lidar_kf_data_{int(time.time())}.csv'
+        with self.data_lock:
+            with open(filename, 'w', newline='') as file:
+                writer = csv.writer(file)
+                writer.writerows(self.output_data)
+        rospy.loginfo(f"Data saved to {filename}")
+
+    def main(self):
+        print("Controls: w:forward-right, z:backward-right, a:forward-left, "
+              "d:backward-left, l:left, r:right, f:forward, b:backward, "
+              "s:stop, t:start attack, y:stop attack, Ctrl+C:quit")
+
+        try:
+            while not rospy.is_shutdown():
+                key = self.get_key()
+                if key == 'w':
+                    self.linear_vel = 0.5
+                    self.angular_vel = 0.5
+                elif key == 'z':
+                    self.linear_vel = -0.5
+                    self.angular_vel = 0.5
+                elif key == 'a':
+                    self.angular_vel = -0.5
+                    self.linear_vel = 0.5
+                elif key == 'd':
+                    self.angular_vel = -0.5
+                    self.linear_vel = -0.5
+                elif key == 'l':
+                    self.angular_vel = -0.5
+                    self.linear_vel = 0.0
+                elif key == 'r':
+                    self.linear_vel = 0.0
+                    self.angular_vel = 0.5
+                elif key == 'f':
+                    self.angular_vel = 0.0
+                    self.linear_vel = 0.5
+                elif key == 'b':
+                    self.linear_vel = -0.5
+                    self.angular_vel = 0.0
+                elif key == 's':
+                    self.linear_vel = 0.0
+                    self.angular_vel = 0.0
+                elif key == 't' and not self.attack_active:
+                    self.attack_active = True
+                    threading.Thread(target=self.attack_flood, daemon=True).start()
+                elif key == 'y':
+                    self.attack_active = False
+                elif key == '\x03':
+                    break
+
+                self.control_input = np.array([self.linear_vel, 0.0, self.angular_vel])
+                self.publish_velocity()
+                self.rate.sleep()
+
+        except Exception as e:
+            print(e)
+        finally:
+            self.attack_active = False
+            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, self.settings)
+
+if __name__ == '__main__':
+    try:
+        teleop = Teleop()
+        teleop.main()
+    except rospy.ROSInterruptException:
+        pass

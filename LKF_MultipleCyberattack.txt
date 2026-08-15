@@ -1,0 +1,409 @@
+import numpy as np
+import random
+import rospy
+from geometry_msgs.msg import Twist
+import sys, select, termios, tty
+from nav_msgs.msg import Odometry
+from sensor_msgs.msg import LaserScan
+from sensor_msgs.msg import PointCloud2
+from squaternion import Quaternion
+import csv
+import threading
+import time
+
+class KalmanFilter:
+    OVERFLOW_LIDAR_THRESHOLD = 10_000
+
+    def __init__(self, initial_state, process_noise, measurement_noise):
+        self.state = np.array([initial_state[0], initial_state[1], initial_state[2],
+                               0.0, 0.0, 0.0])
+        self.P      = np.eye(6) * 0.1
+        self.Q      = np.eye(6) * process_noise
+        self.R      = np.eye(5) * measurement_noise
+        self.base_Q = self.Q.copy()
+        self.base_R = self.R.copy()
+
+        self.last_measurement = np.array([initial_state[0], initial_state[1],
+                                          initial_state[2], 0.0, 0.0])
+        self.anomaly_count    = 0
+        self.error_threshold  = 1.0
+        self.last_time        = time.time()
+
+        self._odom_history    = []
+        self._history_maxlen  = 20
+
+    def predict(self, control_input, dt=0.1, attack_mode='normal'):
+        v, w   = control_input[0], control_input[2]
+        theta  = self.state[2]
+
+        F      = np.eye(6)
+        F[0, 3] = dt * np.cos(theta)
+        F[1, 4] = dt * np.sin(theta)
+        F[2, 5] = dt
+
+        B      = np.zeros((6, 2))
+        B[3, 0] = 1.0
+        B[5, 1] = 1.0
+        u      = np.array([v, w])
+
+        if attack_mode in ('flood', 'overflow'):
+            self.Q = self.base_Q * 4
+        else:
+            self.Q = self.base_Q
+
+        self.state = F @ self.state + B @ u
+        self.P     = F @ self.P @ F.T + self.Q
+
+    def update(self, measurement, attack_mode='normal'):
+        H      = np.zeros((5, 6))
+        H[0, 0] = 1.0
+        H[1, 1] = 1.0
+        H[2, 2] = 1.0
+        H[3, 0] = 1.0
+        H[4, 1] = 1.0
+
+        if attack_mode == 'flood':
+            self.R = np.diag([2.0, 2.0, 2.0, 0.5, 0.5])
+        elif attack_mode == 'overflow':
+            self.R = np.diag([1.5, 1.5, 1.5, 0.3, 0.3])
+        elif attack_mode == 'replay':
+            self.R = np.diag([5.0, 5.0, 5.0, 0.5, 0.5])
+        else:
+            self.R = self.base_R
+
+        z  = np.array(measurement)
+        y  = z - H @ self.state
+        S  = H @ self.P @ H.T + self.R
+        K  = self.P @ H.T @ np.linalg.inv(S)
+
+        self.state = self.state + K @ y
+        self.P     = (np.eye(6) - K @ H) @ self.P
+        return y
+
+    def estimate(self):
+        return self.state[:3]
+
+    def _update_odom_history(self, measurement):
+        self._odom_history.append(np.array(measurement[:3]))
+        if len(self._odom_history) > self._history_maxlen:
+            self._odom_history.pop(0)
+
+    def _replay_pattern_detected(self, control_input):
+        if len(self._odom_history) < 5:
+            return False
+        recent = np.array(self._odom_history[-10:])
+        pos_var = np.var(recent[:, :2], axis=0).mean()
+        moving  = np.linalg.norm(control_input) > 0.05
+        return moving and pos_var < 1e-4
+
+    def detect_anomaly(self, measurement, attack_mode='normal',
+                       control_input=np.array([0.0, 0.0, 0.0]), dt=0.1):
+        residual         = self.update(measurement, attack_mode)
+        diff             = np.linalg.norm(residual)
+        rate_of_change   = np.linalg.norm(
+            np.array(measurement) - self.last_measurement) / max(dt, 1e-6)
+        expected_change  = np.linalg.norm(control_input * dt)
+
+        self._update_odom_history(measurement)
+        self.last_measurement = np.array(measurement).copy()
+
+        is_anomaly = False
+        if attack_mode == 'flood':
+            is_anomaly = (diff > self.error_threshold or
+                          abs(rate_of_change - expected_change) > 1.0)
+            if is_anomaly:
+                self.anomaly_count += 1
+
+        elif attack_mode == 'overflow':
+            is_anomaly = diff > self.error_threshold * 1.5
+            if is_anomaly:
+                self.anomaly_count += 1
+
+        elif attack_mode == 'replay':
+            is_anomaly = self._replay_pattern_detected(control_input) or diff > 2.0
+            if is_anomaly:
+                self.anomaly_count += 1
+
+        elif diff > 2.0:
+            is_anomaly = True
+
+        return {
+            'is_anomaly':       is_anomaly,
+            'diff':             diff,
+            'rate_of_change':   rate_of_change,
+            'expected_change':  expected_change,
+            'estimated_state':  self.estimate(),
+            'covariance_trace': np.trace(self.P[:3, :3])
+        }
+
+class Teleop:
+    def __init__(self):
+        rospy.init_node('husky_teleoperation_kf_lidar')
+
+        self.odom_x = self.odom_y = self.odom_z = self.angle = 0.0
+        self.lidar_x     = self.lidar_y   = 0.0
+        self.lidar_front = float('inf')
+        self.lidar_data  = []
+        self.linear_vel  = self.angular_vel = 0.0
+
+        self.flood_active    = False
+        self.overflow_active = False
+        self.replay_active   = False
+        self.recorded_msgs   = []
+
+        self.lidar_overflow = False
+
+        self.data_lock   = threading.Lock()
+        self.output_data = [[
+            'time', 'attack_type',
+            'odom_x', 'odom_y', 'odom_theta',
+            'lidar_x', 'lidar_y', 'lidar_front',
+            'est_x', 'est_y', 'est_theta',
+            'diff', 'rate_of_change', 'expected_change',
+            'covariance_trace',
+            'linear_vel', 'angular_vel',
+            'anomaly_detected', 'attack_active'
+        ]]
+
+        self.pub_vel       = rospy.Publisher('cmd_vel', Twist, queue_size=10)
+        self.sub_odom      = rospy.Subscriber('odometry/filtered', Odometry,
+                                              self.odom_callback)
+        self.sub_lidar     = rospy.Subscriber('front/scan', LaserScan,
+                                              self.lidar_callback)
+        self.sub_pointcloud = rospy.Subscriber('points', PointCloud2,
+                                               self.pointcloud_callback)
+        self.rate          = rospy.Rate(10)
+        self.settings      = termios.tcgetattr(sys.stdin)
+
+        initial_state       = np.array([0.0, 0.0, 0.0])
+        self.kalman_filter  = KalmanFilter(initial_state=initial_state,
+                                           process_noise=0.01,
+                                           measurement_noise=0.1)
+        self.last_time      = time.time()
+        self.control_input  = np.array([0.0, 0.0, 0.0])
+        rospy.on_shutdown(self.save_data)
+
+    def get_attack_mode(self):
+        if self.replay_active:   return 'replay'
+        if self.flood_active:    return 'flood'
+        if self.overflow_active: return 'overflow'
+        return 'normal'
+
+    def odom_callback(self, msg):
+        self.odom_x = msg.pose.pose.position.x
+        self.odom_y = msg.pose.pose.position.y
+        self.odom_z = msg.pose.pose.position.z
+        q = Quaternion(msg.pose.pose.orientation.w,
+                       msg.pose.pose.orientation.x,
+                       msg.pose.pose.orientation.y,
+                       msg.pose.pose.orientation.z)
+        self.angle = round(q.to_euler(degrees=False)[2], 4)
+
+        if not self.replay_active:
+            self.recorded_msgs.append(msg)
+
+        measurement  = [self.odom_x, self.odom_y, self.angle,
+                        self.lidar_x, self.lidar_y]
+        dt           = time.time() - self.last_time
+        attack_mode  = self.get_attack_mode()
+
+        self.kalman_filter.predict(self.control_input, dt, attack_mode)
+        anomaly_info = self.kalman_filter.detect_anomaly(
+            measurement, attack_mode, self.control_input, dt)
+        self.last_time = time.time()
+
+        if anomaly_info['is_anomaly'] and attack_mode in ('flood', 'overflow', 'replay'):
+            self.correct_control_input(anomaly_info['estimated_state'])
+
+        print(f"\nOdometry : x={self.odom_x:.2f}, y={self.odom_y:.2f}, "
+              f"theta={self.angle:.2f}")
+        print(f"LiDAR    : x={self.lidar_x:.2f}, y={self.lidar_y:.2f}, "
+              f"front={self.lidar_front:.2f}")
+        print(f"Estimated: x={anomaly_info['estimated_state'][0]:.2f}, "
+              f"y={anomaly_info['estimated_state'][1]:.2f}, "
+              f"theta={anomaly_info['estimated_state'][2]:.2f}")
+        print(f"Diff: {anomaly_info['diff']:.3f}  Rate: {anomaly_info['rate_of_change']:.2f}  "
+              f"Expected: {anomaly_info['expected_change']:.2f}")
+        print(f"Cov Trace: {anomaly_info['covariance_trace']:.3f}  "
+              f"Anomaly: {anomaly_info['is_anomaly']}  Attack: {attack_mode}")
+
+        if anomaly_info['is_anomaly']:
+            rospy.logwarn(f"[KF] Anomaly! mode={attack_mode}  "
+                          f"diff={anomaly_info['diff']:.3f}")
+
+        with self.data_lock:
+            self.output_data.append([
+                time.time(), attack_mode,
+                self.odom_x, self.odom_y, self.angle,
+                self.lidar_x, self.lidar_y,
+                round(self.lidar_front, 3) if self.lidar_front < 100 else float('inf'),
+                anomaly_info['estimated_state'][0],
+                anomaly_info['estimated_state'][1],
+                anomaly_info['estimated_state'][2],
+                anomaly_info['diff'],
+                anomaly_info['rate_of_change'],
+                anomaly_info['expected_change'],
+                anomaly_info['covariance_trace'],
+                self.linear_vel, self.angular_vel,
+                int(anomaly_info['is_anomaly']),
+                int(attack_mode != 'normal')
+            ])
+
+    def lidar_callback(self, msg):
+        n = len(msg.ranges)
+        if n > KalmanFilter.OVERFLOW_LIDAR_THRESHOLD:
+            rospy.logwarn(f"[KF] LIDAR overflow detected: {n} ranges (>threshold)")
+            self.lidar_overflow = True
+            self.lidar_data     = []
+            return
+
+        self.lidar_overflow = False
+        self.lidar_data     = msg.ranges
+
+        if n > 10:
+            val = msg.ranges[10]
+            self.lidar_front = val if val >= 0.01 else float('inf')
+        else:
+            self.lidar_front = float('inf')
+
+        valid = [r for r in self.lidar_data if r > 0.1]
+        if valid:
+            min_range    = min(valid)
+            theta        = self.angle
+            self.lidar_x = self.odom_x + min_range * np.cos(theta)
+            self.lidar_y = self.odom_y + min_range * np.sin(theta)
+
+    def pointcloud_callback(self, msg):
+        pass
+
+    def publish_velocity(self):
+        cmd = Twist()
+        cmd.linear.x  = self.linear_vel
+        cmd.angular.z = self.angular_vel
+        self.pub_vel.publish(cmd)
+
+    def correct_control_input(self, estimated_state):
+        self.linear_vel  *= 0.5
+        desired_theta     = estimated_state[2]
+        self.angular_vel  = float(np.clip(desired_theta - self.angle, -0.5, 0.5))
+        rospy.loginfo(f"[KF] Correcting: lin={self.linear_vel:.2f}  "
+                      f"ang={self.angular_vel:.2f}")
+
+    def attack_flood_thread(self):
+        rate = rospy.Rate(1000)
+        msg  = Twist()
+        msg.linear.x  = 1.0
+        msg.angular.z = 1.0
+        rospy.logwarn("[KF] Flood attack started (1000 Hz)")
+        while self.flood_active and not rospy.is_shutdown():
+            self.pub_vel.publish(msg)
+            rate.sleep()
+        rospy.logwarn("[KF] Flood attack stopped")
+
+    def attack_overflow_thread(self):
+        pub  = rospy.Publisher('front/scan', LaserScan, queue_size=1)
+        rate = rospy.Rate(100)
+        msg  = LaserScan()
+        msg.header.frame_id = "laser"
+        msg.ranges          = [1.0] * 1_000_000
+        rospy.logwarn("[KF] Overflow attack started (large LaserScan)")
+        while self.overflow_active and not rospy.is_shutdown():
+            msg.header.stamp = rospy.Time.now()
+            pub.publish(msg)
+            rate.sleep()
+        rospy.logwarn("[KF] Overflow attack stopped")
+
+    def attack_replay_thread(self):
+        if not self.recorded_msgs:
+            rospy.logwarn("[KF] No messages recorded for replay")
+            self.replay_active = False
+            return
+        pub  = rospy.Publisher('odometry/filtered', Odometry, queue_size=10)
+        rate = rospy.Rate(10)
+        rospy.logwarn(f"[KF] Replay attack started ({len(self.recorded_msgs)} msgs)")
+        while self.replay_active and not rospy.is_shutdown():
+            for msg in self.recorded_msgs:
+                if not self.replay_active:
+                    break
+                pub.publish(msg)
+                rate.sleep()
+        rospy.logwarn("[KF] Replay attack stopped")
+
+    def get_key(self):
+        tty.setraw(sys.stdin.fileno())
+        rlist, _, _ = select.select([sys.stdin], [], [], 0.1)
+        key = sys.stdin.read(1) if rlist else ''
+        termios.tcsetattr(sys.stdin, termios.TCSADRAIN, self.settings)
+        return key
+
+    def save_data(self):
+        filename = f'odom_lidar_kf_data_{int(time.time())}.csv'
+        with self.data_lock:
+            with open(filename, 'w', newline='') as f:
+                csv.writer(f).writerows(self.output_data)
+        rospy.loginfo(f"[KF] Data saved → {filename}")
+
+    def main(self):
+        print("=== KF Teleop – Multi-Attack + Enhanced LIDAR ===")
+        print("Movement : w/z/a/d/l/r/f/b/s")
+        print("Flood    : t = ON   y = OFF")
+        print("Overflow : v = ON   m = OFF")
+        print("Replay   : q = ON   e = OFF  (drive normally first)")
+        print("Quit     : Ctrl+C\n")
+
+        try:
+            while not rospy.is_shutdown():
+                key = self.get_key()
+
+                if   key == 'w': self.linear_vel, self.angular_vel =  0.5,  0.5
+                elif key == 'z': self.linear_vel, self.angular_vel = -0.5,  0.5
+                elif key == 'a': self.linear_vel, self.angular_vel =  0.5, -0.5
+                elif key == 'd': self.linear_vel, self.angular_vel = -0.5, -0.5
+                elif key == 'l': self.linear_vel, self.angular_vel =  0.0, -0.5
+                elif key == 'r': self.linear_vel, self.angular_vel =  0.0,  0.5
+                elif key == 'f': self.linear_vel, self.angular_vel =  0.5,  0.0
+                elif key == 'b': self.linear_vel, self.angular_vel = -0.5,  0.0
+                elif key == 's': self.linear_vel, self.angular_vel =  0.0,  0.0
+
+                elif key == 't' and not self.flood_active:
+                    self.flood_active = True
+                    threading.Thread(target=self.attack_flood_thread,
+                                     daemon=True).start()
+                elif key == 'y':
+                    self.flood_active = False
+
+                elif key == 'v' and not self.overflow_active:
+                    self.overflow_active = True
+                    threading.Thread(target=self.attack_overflow_thread,
+                                     daemon=True).start()
+                elif key == 'm':
+                    self.overflow_active = False
+
+                elif key == 'q' and not self.replay_active:
+                    if not self.recorded_msgs:
+                        print("→ No odometry recorded yet – drive normally first!")
+                    else:
+                        self.replay_active = True
+                        threading.Thread(target=self.attack_replay_thread,
+                                         daemon=True).start()
+                elif key == 'e':
+                    self.replay_active = False
+
+                elif key == '\x03':
+                    break
+
+                self.control_input = np.array([self.linear_vel, 0.0, self.angular_vel])
+                self.publish_velocity()
+                self.rate.sleep()
+
+        except Exception as exc:
+            print(exc)
+        finally:
+            self.flood_active = self.overflow_active = self.replay_active = False
+            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, self.settings)
+
+if __name__ == '__main__':
+    try:
+        Teleop().main()
+    except rospy.ROSInterruptException:
+        pass

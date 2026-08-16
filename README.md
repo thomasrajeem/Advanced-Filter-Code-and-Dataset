@@ -203,9 +203,6 @@ Architecture
 │                                                     │
 └─────────────────────────────────────────────────────┘
 
-License
-This project is licensed under the MIT License - see the LICENSE file for details.
-
 Acknowledgments
 - ROS community for robot middleware
 - Contributors to the squaternion library for quaternion operations
